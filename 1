@@ -1,0 +1,146 @@
+import gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tensorboardX import SummaryWriter
+
+import numpy
+from collections import namedtuple
+
+HIDDEN_SIZE = 128
+BATCH_SIZE = 16
+PERCENTILE = 70
+
+Episode = namedtuple('Episode', field_names=['reward', 'steps'])
+Episode_Steps = namedtuple('Episode_Steps', field_names=['observation', 'action'])
+
+
+class Net(nn.Module):
+    def __init__(self, num_obs, num_hidden, num_act):
+        super(Net, self).__init__()
+        self.pipe = nn.Sequential(
+            nn.Linear(num_obs,num_hidden),
+            nn.ReLU(),
+            nn.Linear(num_hidden, num_act)
+        )
+    
+    def forward(self, x):
+        return self.pipe(x)
+
+
+def iterate_batches(env_problem, env_net, num_batch):
+    
+    batch = []
+    episode_reward = 0.0
+    episode_step = []
+
+    obs = env_problem.reset()
+
+    sm = nn.Softmax(dim=1)                       #Due to more numerically stable calculations we use softmax outside the net class
+    
+    while True:
+        obs_vtf = torch.FloatTensor([obs])       #Both network and softmax use and outputs tensor, BUT GYM ENVIORNMENT USE NUMPY
+        act_prob_vtf = sm(env_net(obs_vtf))
+        act_prob = act_prob_vtf.data.numpy()[0]  
+        act_option_selected = numpy.random.choice(len(act_prob), p=act_prob)
+
+        next_obs, reward, is_done, _ = env_problem.step(act_option_selected)  
+        episode_reward += reward
+
+        episode_step.append(Episode_Steps(observation = obs, action = act_option_selected))
+
+        if is_done:
+            batch.append(Episode(reward=episode_reward, steps=episode_step))
+            
+            episode_reward = 0.0
+            episode_step = []
+
+            next_obs = env_problem.reset()
+            
+            if len(batch) == num_batch:
+                yield batch
+                batch = []
+
+        obs = next_obs    
+
+
+def filter_batch(batch, percentile):
+    rewards = list(map(lambda s: s.reward, batch))
+    reward_bound = numpy.percentile(rewards, percentile)
+    reward_mean = float(numpy.mean(rewards))
+
+    train_obs = []
+    train_acts = []
+    for reward, steps in batch:
+        if reward < reward_bound:
+            continue
+        
+        train_acts.extend(map(lambda s: s.action, steps))
+        train_obs.extend(map(lambda s: s.observation, steps))
+
+    train_acts_vtf = torch.LongTensor(train_acts)    #64 BIT INT SIGNED
+    train_obs_vtf = torch.FloatTensor(train_obs)     #32 BIT FLOAT
+    return train_obs_vtf, train_acts_vtf, reward_bound, reward_mean
+
+
+if __name__ == "__main__":
+    
+    env = gym.make("CartPole-v0")
+    
+    obs_size = env.observation_space.shape[0]    #For observation use .shape[0]
+    act_size = env.action_space.n                #For action use .n
+
+    net_cartpole = Net(obs_size, HIDDEN_SIZE, act_size)
+    obj_func = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(net_cartpole.parameters(), lr=0.01)
+
+    writer = SummaryWriter(comment="-cartpole")
+
+    for iter_no, iter_batch in enumerate(iterate_batches(env, net_cartpole, BATCH_SIZE)):
+
+        obs, act, rew_b, rew_m = filter_batch(iter_batch, PERCENTILE)
+
+        optimizer.zero_grad()
+        act_scores_vtf = net_cartpole(obs)
+        loss_vtf = obj_func(act_scores_vtf, act)
+        loss_vtf.backward()                            #Calculate the gradients on the loss
+        optimizer.step()
+
+        print("%d: loss=%.3f, reward_mean=%.1f, reward_bound=%.1f" % (iter_no, loss_vtf.item(), rew_b, rew_m))
+
+        writer.add_scalar("loss", loss_vtf.item(), iter_no)
+        writer.add_scalar("reward_mean", rew_m, iter_no)
+        writer.add_scalar("reward_bound", rew_b, iter_no)
+
+        if rew_m > 199:
+            print("Solved!")
+            break
+
+        writer.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+
+
+
+
+
+
